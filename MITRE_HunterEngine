@@ -1,0 +1,238 @@
+# HunterEngine - Heuristic Threat Enrichment Engine
+
+HunterEngine is a command line threat enrichment engine for:
+
+- blue teams
+- threat hunters
+- security researchers
+
+It ingests unstructured text (emails, SMS, logs, exports), enriches it with indicators and MITRE ATT&CK context, scores risk, and generates high fidelity YARA rules. All results are saved into a per session folder for easy review and triage.
+
+Author: PsypherLabs  
+License: MIT
+
+---
+
+## What It Does
+
+For each input item, HunterEngine:
+
+- applies heuristic "threat primitives" (urgency, authority, financial, etc)
+- extracts indicators of compromise (IoCs):
+  - URLs
+  - domains
+  - email addresses
+  - IPv4 addresses
+- maps text to MITRE ATT&CK techniques using STIX data and fuzzy matching
+- computes a risk score and risk level:
+  - INFO, LOW, MEDIUM, HIGH, CRITICAL
+- optionally generates a YARA rule, only when there are strong strings to match on
+- writes structured outputs to a timestamped session directory
+
+---
+
+## Key Features
+
+- Heuristic threat scoring
+  - Keyword based primitives
+  - Configurable scores and thresholds
+- IoC extraction
+  - Simple, readable regex based detection
+  - De duplication of domains inside URLs
+- MITRE ATT&CK enrichment
+  - Uses official MITRE CTI STIX data
+  - Local cache for fast reuse
+- YARA rule generation
+  - Concrete string based
+  - Guardrails to avoid noisy rules
+- Reporting
+  - Full JSON results
+  - Consolidated IoCs
+  - Combined YARA rules file
+  - Stats and markdown summary
+
+---
+
+## Requirements
+
+- Python 3.8 or newer
+- Internet on first run (to download MITRE CTI data)
+- Python packages:
+  - requests
+  - tqdm
+  - rapidfuzz
+  - stix2
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+# or
+pip install requests tqdm rapidfuzz stix2
+
+
+⸻
+
+Quick Start
+	1.	Install dependencies:
+
+pip install -r requirements.txt
+
+	2.	Prepare an input file, for example emails.txt:
+
+Your account will be suspended unless you verify your login now...
+Click here to update your payment information...
+
+	3.	Run HunterEngine:
+
+python3 HunterEngine.py emails.txt
+
+	4.	Open the results folder:
+
+ClassifierBox/session_<timestamp>/
+
+You will see files like:
+	•	results.json
+	•	_all_indicators.json
+	•	_all_yara_rules.yara
+	•	_stats.json
+	•	_summary_report.md
+
+⸻
+
+CLI Usage
+
+Show help:
+
+python3 HunterEngine.py -h
+
+Arguments:
+	•	input (positional)
+Path to the input file (.txt, .csv, .json).
+	•	-c, –config
+Path to configuration JSON file.
+Default: threat_primitives.json
+	•	–no-banner
+Suppress the ASCII banner and manual.
+
+Examples:
+
+# TXT file, one item per line
+python3 HunterEngine.py samples/emails.txt
+
+# CSV file, first column is the text
+python3 HunterEngine.py samples/sms.csv
+
+# JSON file (list or dict)
+python3 HunterEngine.py samples/events.json
+
+# Use a custom threat model
+python3 HunterEngine.py emails.csv -c primitives/bec_primitives.json
+
+# Run quietly, no banner
+python3 HunterEngine.py emails.txt --no-banner
+
+
+⸻
+
+Supported Input Formats
+	1.	.txt
+	•	Each non empty line is treated as one input item.
+	2.	.csv
+	•	First column of each row is used as the input text.
+	3.	.json
+	•	If root is a list:
+	•	each element is:
+	•	a dict with an “input” field, or
+	•	any value that will be converted to string.
+	•	If root is a dict:
+	•	uses dict["input"] if present, else str(dict).
+
+⸻
+
+Output Files
+
+Each run creates a new folder:
+
+ClassifierBox/session_YYYY-MM-DD_HH-MM-SS/
+
+Inside:
+	•	results.json
+Full enrichment results for every input.
+	•	_all_indicators.json
+All IoCs with the original text and risk level.
+	•	_all_yara_rules.yara
+All generated YARA rules in one file.
+	•	_stats.json
+Summary stats:
+	•	total inputs
+	•	risk level counts
+	•	tag counts
+	•	top MITRE techniques
+	•	_summary_report.md
+Human readable markdown report with:
+	•	executive summary
+	•	risk distribution
+	•	top HIGH and CRITICAL items
+
+At the repo root:
+	•	missed_inputs.log
+Inputs that produced no tags (for tuning).
+	•	failed_inputs.log
+Inputs that caused an error while processing.
+
+⸻
+
+Configuration
+
+Configuration is stored in a JSON file (default: threat_primitives.json).
+
+It controls:
+	•	fuzzy matching threshold
+	•	risk thresholds for LOW, MEDIUM, HIGH
+	•	score boosts for indicators and MITRE matches
+	•	threat primitives and keyword lists
+
+If the file does not exist, HunterEngine creates a default one.
+
+Example:
+
+{
+  "config": {
+    "fuzzy_threshold": 85,
+    "risk_thresholds": {
+      "LOW": 4,
+      "MEDIUM": 8,
+      "HIGH": 12
+    },
+    "score_boosts": {
+      "has_indicator": 5,
+      "mitre_ttp": 6
+    }
+  },
+  "primitives": {
+    "urgency": {
+      "score": 3,
+      "keywords": ["urgent", "immediate", "action required"]
+    }
+  }
+}
+
+You can edit this file to match your environment (phishing, BEC, fraud, etc).
+
+⸻
+
+Ethical and Legal Use
+
+This tool is for legitimate cybersecurity work only:
+	•	blue team operations
+	•	threat hunting
+	•	incident response
+	•	security research
+
+Use it only on systems and data you are authorized to analyze.
+You are responsible for your actions.
+
+See the LICENSE file and the built in manual for the full legal notice.
+
+
