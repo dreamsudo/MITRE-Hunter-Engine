@@ -1,0 +1,915 @@
+Project Structure Overview
+
+    HunterEngine/
+├── HunterEngine.py
+├── README.md
+├── LICENSE
+├── MANUAL.md
+├── LEGAL_DISCLOSURE.md
+├── requirements.txt
+└── primitives/
+    ├── default_phishing_primitives.json
+    ├── bec_financial_primitives.json
+    └── insider_exfil_primitives.json
+  
+
+
+FILE 1: HunterEngine.py
+
+    #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+###############################################################################
+#
+#                      *
+#                     ***
+#                    *****
+#                   *******
+#                  *********
+#                 ***********
+#                *****Psypher*****
+#                 *****Labs *****
+#                  ***********
+#                   *******
+#                    *****
+#                     ***
+#                      *
+#
+#   HunterEngine.py - Heuristic Threat Enrichment Engine by PsypherLabs
+#
+###############################################################################
+#
+# Author: PsypherLabs
+#
+# Description:
+#   - Ingests unstructured text data (emails, SMS, logs) for analysis.
+#   - Enriches inputs with heuristic tags, IoCs, and MITRE ATT&CK TTPs.
+#   - Calculates a risk score and generates high-fidelity YARA rules.
+#   - Outputs all findings to a structured session folder with reports.
+#   - Intended for Blue Teams, Threat Hunters, and Security Researchers.
+#
+# MIT License - Copyright (c) 2025 PsypherLabs
+# See LICENSE file for details.
+#
+###############################################################################
+
+# --- Standard Library Imports ---
+import os
+import re
+import sys
+import csv
+import json
+import argparse
+import logging
+import zipfile
+import io
+from datetime import datetime
+from collections import Counter
+from typing import List, Dict, Any, Tuple, Generator, Iterable
+
+# --- Dependency Check & Third-Party Imports ---
+try:
+    import requests
+    from tqdm import tqdm
+    from rapidfuzz import fuzz
+    from stix2 import MemoryStore, Filter, exceptions
+except ImportError as e:
+    print("\n--- Missing Dependencies ---")
+    print(f"Error: A required library is missing: '{e.name}'")
+    print("Please install all dependencies by running:")
+    print("pip install requests tqdm rapidfuzz stix2")
+    print("Or, if a requirements.txt file is present:")
+    print("pip install -r requirements.txt")
+    print("--------------------------\n")
+    sys.exit(1)
+
+# --- Banners and Manuals ---
+
+def print_banner():
+    """Prints the ASCII art logo in bright green."""
+    # This line enables ANSI escape sequence processing on Windows.
+    if os.name == 'nt':
+        os.system('')
+        
+    bright_green = "\033[92m"
+    reset_color = "\033[0m"
+    
+    banner = f"""{bright_green}
+                      *
+                     ***
+                    *****
+                   *******
+                  *********
+                 ***********
+                *****Psypher*****
+                 *****Labs *****
+                  ***********
+                   *******
+                    *****
+                     ***
+                      *
+
+        HunterEngine by PsypherLabs
+  Heuristic Threat Enrichment & Hunting Engine
+{reset_color}"""
+    print(banner)
+
+def print_manual_and_license():
+    """Prints the quick start manual, license, and legal disclosure."""
+    manual = """
+===============================================================================
+ MIT LICENSE & ETHICAL USE NOTICE
+===============================================================================
+Copyright (c) 2025 PsypherLabs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--- LEGAL & ETHICAL USE DISCLOSURE ---
+This tool is intended for legitimate cybersecurity purposes ONLY, including
+blue team analysis, threat hunting, and security research. Unauthorized use
+of this tool on any system or with any data for which you do not have explicit
+permission is strictly prohibited. The authors are not responsible for any
+misuse or damage caused by this program. YOU ARE RESPONSIBLE FOR YOUR ACTIONS.
+===============================================================================
+"""
+    print(manual)
+
+# --- GLOBAL CONFIGURATION & LOGGING ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants for data sources and file paths
+MITRE_CTI_URL = "https://github.com/mitre/cti/archive/refs/heads/master.zip"
+MITRE_DIRS = ["attack-stix-data/enterprise-attack", "attack-stix-data/mobile-attack", "attack-stix-data/ics-attack"]
+OUTPUT_ROOT = "HunterEngineBox"
+MISS_LOG = "missed_inputs.log"
+ERROR_LOG = "failed_inputs.log"
+MITRE_CACHE_FILE = "mitre_cache.json"
+DEFAULT_PRIMITIVES_CONFIG_FILE = "primitives/default_phishing_primitives.json"
+
+class ThreatEnrichmentEngine:
+    """
+    A class to encapsulate all threat enrichment logic, from data setup to
+    analysis and artifact generation.
+    """
+    def __init__(self, config_path: str = DEFAULT_PRIMITIVES_CONFIG_FILE):
+        self.config_path = config_path
+        self.mitre_keywords = {}
+        self.mitre_metadata = []
+        self.heuristic_classifiers = []
+        self.risk_thresholds = {"LOW": 4, "MEDIUM": 8, "HIGH": 12}
+        self.fuzzy_threshold = 85
+        self.score_boosts = {"has_indicator": 5, "mitre_ttp": 6}
+
+    def get_risk_level(self, score: int) -> str:
+        if score == 0: return "INFO"
+        if score <= self.risk_thresholds["LOW"]: return "LOW"
+        if score <= self.risk_thresholds["MEDIUM"]: return "MEDIUM"
+        if score <= self.risk_thresholds["HIGH"]: return "HIGH"
+        return "CRITICAL"
+
+    def setup_dependencies(self):
+        self._load_configuration()
+        self._setup_mitre_data()
+        self.mitre_keywords, self.mitre_metadata = self._get_mitre_data()
+
+    def _load_configuration(self):
+        if not os.path.exists(self.config_path):
+            logging.error(f"Configuration file not found at '{self.config_path}'.")
+            logging.error("Please ensure a primitives file exists or use the -c flag to specify a path.")
+            sys.exit(1)
+
+        logging.info(f"Loading configuration from {self.config_path}")
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+
+        engine_config = config_data.get("config", {})
+        self.fuzzy_threshold = engine_config.get("fuzzy_threshold", self.fuzzy_threshold)
+        self.risk_thresholds = engine_config.get("risk_thresholds", self.risk_thresholds)
+        self.score_boosts = engine_config.get("score_boosts", self.score_boosts)
+        logging.info(f"Risk thresholds set to: {self.risk_thresholds}")
+        logging.info(f"Fuzzy matching threshold set to: {self.fuzzy_threshold}")
+        logging.info(f"Score boosts set to: {self.score_boosts}")
+
+        primitives = config_data.get("primitives", {})
+        compiled_classifiers = []
+        for name, data in primitives.items():
+            pattern = r'\b(' + '|'.join(re.escape(k) for k in data["keywords"]) + r')\b'
+            compiled_classifiers.append({
+                "name": name,
+                "score": data.get("score", 1),
+                "regex": re.compile(pattern, re.IGNORECASE)
+            })
+        self.heuristic_classifiers = compiled_classifiers
+        logging.info(f"Heuristic classifiers built for: {', '.join(primitives.keys())}")
+
+    def _setup_mitre_data(self):
+        if os.path.exists("attack-stix-data"): return
+        logging.warning("MITRE ATT&CK data not found. Downloading automatically... (approx. 70MB)")
+        try:
+            response = requests.get(MITRE_CTI_URL, stream=True, timeout=60)
+            response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                for member in tqdm(zf.infolist(), desc="Extracting MITRE data"):
+                    parts = member.filename.split('/')[1:]
+                    if not parts or parts[0] not in ["enterprise-attack", "mobile-attack", "ics-attack"]:
+                        continue
+                    
+                    target_path = os.path.join("attack-stix-data", *parts)
+                    if not member.is_dir():
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        with open(target_path, "wb") as f: f.write(zf.read(member.filename))
+            logging.info("MITRE ATT&CK data downloaded and extracted successfully.")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error downloading MITRE data: {e}", exc_info=True)
+            sys.exit(1)
+        except Exception as e:
+            logging.error(f"Failed to download or extract MITRE data: {e}", exc_info=True)
+            sys.exit(1)
+
+    def _get_mitre_data(self) -> Tuple[Dict, List]:
+        if os.path.exists(MITRE_CACHE_FILE):
+            logging.info(f"Loading MITRE data from cache: {MITRE_CACHE_FILE}")
+            with open(MITRE_CACHE_FILE, "r", encoding="utf-8") as f: cache = json.load(f)
+            return cache["keywords"], cache["metadata"]
+
+        logging.info("MITRE cache not found. Building cache from STIX data...")
+        store = MemoryStore()
+        for folder in MITRE_DIRS:
+            path = os.path.join(folder, f"{os.path.basename(folder)}.json")
+            if not os.path.exists(path):
+                logging.warning(f"STIX file not found, skipping: {path}")
+                continue
+            logging.info(f"Processing STIX data from: {path}")
+            try:
+                store.load_from_file(path)
+            except Exception as e: logging.error(f"Failed to process {path}: {e}")
+
+        logging.info("Extracting and caching MITRE ATT&CK techniques...")
+        mitre_keywords, mitre_metadata = {}, []
+        tech_filter = [Filter("type", "=", "attack-pattern"), Filter("revoked", "=", False)]
+        for obj in store.query(tech_filter):
+            if obj.get("x_mitre_deprecated", False): continue
+            
+            tid = next((ref.get("external_id") for ref in obj.get("external_references", []) if ref.get("source_name", "").startswith("mitre-")), None)
+            if not tid: continue
+            
+            phrases = {s.strip().lower() for s in re.split(r'[.?!]\s+', obj.get("description", "")) if 5 <= len(s.strip()) <= 150}
+            name = obj.get("name", "").strip().lower()
+            if name and len(name) > 4: phrases.add(name)
+            
+            if phrases:
+                mitre_keywords[tid] = sorted(list(phrases))
+                mitre_metadata.append({
+                    "id": tid,
+                    "name": obj.get("name", "N/A"),
+                    "tactic": next((p.get("phase_name") for p in obj.get("kill_chain_phases", [])), "unknown")
+                })
+
+        with open(MITRE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"keywords": mitre_keywords, "metadata": mitre_metadata}, f, indent=2)
+        logging.info(f"Saved {len(mitre_keywords)} MITRE techniques to cache: {MITRE_CACHE_FILE}")
+        return mitre_keywords, mitre_metadata
+
+    def _extract_indicators(self, text: str) -> Dict[str, List[str]]:
+        ipv4_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+        patterns = {
+            "urls": re.compile(r'https?://[^\s/$.?#].[^\s]*', re.IGNORECASE),
+            "domains": re.compile(r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}\b'),
+            "emails": re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
+            "ipv4": re.compile(ipv4_pattern)
+        }
+        indicators = {name: list(set(p.findall(text))) for name, p in patterns.items()}
+        
+        if indicators.get("domains") and indicators.get("urls"):
+            url_domains = {re.search(patterns["domains"], url).group(0) for url in indicators["urls"] if re.search(patterns["domains"], url)}
+            indicators["domains"] = [d for d in indicators["domains"] if d not in url_domains]
+
+        return {k: v for k, v in indicators.items() if v}
+
+    def _sanitize_yara_string(self, value: str) -> str:
+        value = value.replace('\\', '\\\\')
+        value = value.replace('"', '\\"')
+        return ''.join(c if 32 <= ord(c) < 127 else f'\\x{ord(c):02x}' for c in value)
+
+    def _generate_yara_rule(self, result: Dict) -> str:
+        if result['analysis']['risk_score'] == 0:
+            return ""
+
+        high_confidence_strings = []
+        for data in result['analysis']['matched_primitives'].values():
+            high_confidence_strings.extend(data['matches'])
+        for ind_list in result['indicators'].values():
+            high_confidence_strings.extend(ind_list)
+        
+        if not high_confidence_strings:
+            logging.debug(f"Skipping YARA rule for '{result['input'][:50]}...' due to lack of concrete strings.")
+            return ""
+
+        rule_name = f"threat_heuristic_{re.sub(r'[^a-zA-Z0-9_]', '', result['input'].replace(' ', '_'))[:50]}_{int(datetime.now().timestamp())}"
+        
+        meta = result['analysis'].copy()
+        meta["input_text"] = self._sanitize_yara_string(result["input"][:1024])
+        if result['mitre_matches']:
+            meta["mitre_ttps"] = ", ".join([m["id"] for m in result["mitre_matches"]])
+        meta_fields = [f'\t\t{k} = "{self._sanitize_yara_string(str(v))}"' for k, v in meta.items() if k != 'matched_primitives']
+        
+        string_fields = [f'\t\t$s{i+1} = "{self._sanitize_yara_string(s)}" nocase wide ascii' for i, s in enumerate(set(high_confidence_strings))]
+
+        condition = "2 of them" if len(string_fields) > 2 else "all of them"
+
+        return f"""
+rule {rule_name}
+{{
+    meta:
+{os.linesep.join(meta_fields)}
+    strings:
+{os.linesep.join(string_fields)}
+    condition:
+        {condition}
+}}
+"""
+
+    def enrich_text(self, text: str) -> Dict:
+        matched_primitives = {}
+        for classifier in self.heuristic_classifiers:
+            matches = list(set(classifier["regex"].findall(text.lower())))
+            if matches:
+                matched_primitives[classifier["name"]] = {"score": classifier["score"], "matches": matches}
+
+        risk_score = sum(p["score"] for p in matched_primitives.values())
+        tags = set(matched_primitives.keys())
+
+        indicators = self._extract_indicators(text)
+        if indicators:
+            tags.add("has_indicator")
+            risk_score += self.score_boosts.get("has_indicator", 5)
+
+        matched_tids = {tid for tid, phrases in self.mitre_keywords.items() if any(fuzz.partial_ratio(phrase, text.lower()) >= self.fuzzy_threshold for phrase in phrases)}
+        
+        mitre_matches = []
+        if matched_tids:
+            tags.add("mitre_ttp")
+            risk_score += self.score_boosts.get("mitre_ttp", 6)
+            for tid in sorted(list(matched_tids)):
+                if (tech := next((t for t in self.mitre_metadata if t["id"] == tid), None)):
+                    mitre_matches.append({"id": tech["id"], "name": tech["name"]})
+                    if tech['tactic'] != 'unknown': tags.add(tech['tactic'])
+
+        if not tags:
+            with open(MISS_LOG, "a", encoding="utf-8") as f: f.write(text + "\n")
+
+        result = {
+            "input": text,
+            "analysis": {
+                "risk_score": risk_score,
+                "risk_level": self.get_risk_level(risk_score),
+                "tags": sorted(list(tags)),
+                "matched_primitives": matched_primitives
+            },
+            "indicators": indicators,
+            "mitre_matches": mitre_matches
+        }
+        result["yara_rule"] = self._generate_yara_rule(result)
+        return result
+
+    def process_batch(self, inputs: Iterable[str]) -> List[Dict]:
+        logging.info("Starting enrichment process...")
+        results = []
+        for text in tqdm(inputs, desc="Enriching"):
+            try:
+                if not text or not isinstance(text, str): continue
+                results.append(self.enrich_text(text))
+            except Exception as e:
+                logging.error(f"Failed to process input: '{text[:100]}...'. Error: {e}", exc_info=True)
+                with open(ERROR_LOG, "a", encoding="utf-8") as f:
+                    f.write(f"{text}\n")
+        return results
+
+def load_inputs(path: str) -> Generator[str, None, None]:
+    if not os.path.exists(path):
+        logging.error(f"Input file not found: {path}")
+        sys.exit(1)
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            if path.lower().endswith(".csv"):
+                reader = csv.reader(f)
+                for row in reader:
+                    if row: yield row[0]
+            elif path.lower().endswith(".json"):
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        yield item.get("input", str(item)) if isinstance(item, dict) else str(item)
+                elif isinstance(data, dict):
+                     yield data.get("input", str(data))
+            else:
+                for line in f:
+                    if stripped := line.strip():
+                        yield stripped
+    except Exception as e:
+        logging.error(f"Failed to read input file {path}: {e}", exc_info=True)
+        sys.exit(1)
+
+def save_results(results: List[Dict]):
+    if not results:
+        logging.warning("No results were generated. Skipping output file creation.")
+        return
+    session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    session_path = os.path.join(OUTPUT_ROOT, f"session_{session_id}")
+    os.makedirs(session_path, exist_ok=True)
+    logging.info(f"Saving results to directory: {session_path}")
+
+    with open(os.path.join(session_path, "results.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    contextual_indicators = []
+    for res in results:
+        if res['indicators']:
+            contextual_indicators.append({
+                "input": res['input'],
+                "risk_level": res['analysis']['risk_level'],
+                "indicators": res['indicators']
+            })
+    if contextual_indicators:
+        with open(os.path.join(session_path, "_all_indicators.json"), "w", encoding="utf-8") as f:
+            json.dump(contextual_indicators, f, indent=2)
+
+    all_yara_rules = [res['yara_rule'] for res in results if res['yara_rule']]
+    if all_yara_rules:
+        with open(os.path.join(session_path, "_all_yara_rules.yara"), "w", encoding="utf-8") as f:
+            f.write("\n".join(all_yara_rules))
+
+    stats = {
+        "session_id": session_id,
+        "total_inputs_processed": len(results),
+        "risk_level_counts": dict(Counter(r["analysis"]["risk_level"] for r in results)),
+        "tag_counts": dict(Counter(tag for r in results for tag in r['analysis']['tags']).most_common()),
+        "top_10_mitre_techniques": [{
+            "id": k[0],
+            "name": k[1],
+            "count": v
+        } for k, v in Counter((m["id"], m.get("name")) for r in results for m in r["mitre_matches"]).most_common(10)]
+    }
+    with open(os.path.join(session_path, "_stats.json"), "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    generate_summary_report(results, stats, os.path.join(session_path, "_summary_report.md"))
+    logging.info("All output files saved successfully.")
+
+def generate_summary_report(results: List[Dict], stats: Dict, path: str):
+    report_lines = [f"# Threat Enrichment Report: {stats['session_id']}", ""]
+    
+    report_lines.append("## Executive Summary")
+    report_lines.append(f"- **Total Inputs Analyzed:** {stats['total_inputs_processed']}")
+    report_lines.append("- **Risk Level Distribution:**")
+    risk_order = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    for level, count in sorted(stats['risk_level_counts'].items(), key=lambda item: risk_order.index(item[0])):
+        report_lines.append(f"  - {level}: {count}")
+    report_lines.append("")
+
+    report_lines.append("## High-Risk Items")
+    high_risk_items = sorted([r for r in results if r['analysis']['risk_level'] in ["HIGH", "CRITICAL"]], key=lambda x: x['analysis']['risk_score'], reverse=True)
+    if not high_risk_items:
+        report_lines.append("No HIGH or CRITICAL risk items found.")
+    else:
+        for item in high_risk_items[:20]:
+            report_lines.append(f"### Input: `{item['input'][:200]}`")
+            report_lines.append(f"- **Risk Score:** {item['analysis']['risk_score']} ({item['analysis']['risk_level']})")
+            report_lines.append(f"- **Tags:** `{', '.join(item['analysis']['tags'])}`")
+            if item['indicators']:
+                report_lines.append("- **Indicators:**")
+                for ind_type, ind_list in item['indicators'].items():
+                    report_lines.append(f"  - {ind_type.capitalize()}: `{', '.join(ind_list)}`")
+            if item['mitre_matches']:
+                report_lines.append("- **MITRE TTPs:**")
+                for match in item['mitre_matches']:
+                    report_lines.append(f"  - {match['id']}: {match['name']}")
+            report_lines.append("")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(report_lines))
+    logging.info(f"Human-readable summary report saved to: {path}")
+
+
+def main():
+    """
+    Main execution function. Orchestrates the setup, data loading, processing,
+    and saving of results.
+    """
+    manual_epilog = """
+===============================================================================
+ QUICK START MANUAL
+===============================================================================
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Run the engine against an input file:
+   python3 HunterEngine.py /path/to/your/input.txt
+
+3. Use a custom configuration for different threat models:
+   python3 HunterEngine.py emails.csv -c primitives/bec_financial_primitives.json
+
+4. Find all generated reports, IoCs, and YARA rules in:
+   ./HunterEngineBox/session_<timestamp>/
+===============================================================================
+"""
+    parser = argparse.ArgumentParser(
+        description="HunterEngine by PsypherLabs - A Heuristic Threat Enrichment Engine.",
+        epilog=manual_epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("input", help="Path to the input file (.txt, .csv, .json).")
+    parser.add_argument(
+        "-c", "--config",
+        default=DEFAULT_PRIMITIVES_CONFIG_FILE,
+        help=f"Path to a custom configuration JSON file (default: {DEFAULT_PRIMITIVES_CONFIG_FILE})."
+    )
+    parser.add_argument(
+        '--no-banner',
+        action='store_true',
+        help='Suppress the startup banner and manual.'
+    )
+    args = parser.parse_args()
+
+    if not args.no_banner:
+        print_banner()
+        print_manual_and_license()
+
+    for log_file in [MISS_LOG, ERROR_LOG]:
+        if os.path.exists(log_file):
+            os.remove(log_file)
+
+    engine = ThreatEnrichmentEngine(config_path=args.config)
+    engine.setup_dependencies()
+    
+    inputs = load_inputs(args.input)
+    
+    results = engine.process_batch(inputs)
+    
+    save_results(results)
+
+if __name__ == "__main__":
+    main()
+  
+
+
+FILE 2: README.md
+
+    # HunterEngine - Heuristic Threat Enrichment Engine
+
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)
+
+`HunterEngine` is a standalone, production-grade security tool that enriches unstructured text data with actionable threat intelligence and automatically generates high-fidelity YARA rules for proactive threat hunting.
+
+<p align="center">
+  <pre>
+                      *
+                     ***
+                    *****
+                   *******
+                  *********
+                 ***********
+                *****Psypher*****
+                 *****Labs *****
+                  ***********
+                   *******
+                    *****
+                     ***
+                      *
+  </pre>
+</p>
+
+---
+
+### Key Features
+
+-   **Automated Triage:** Ingests raw text (emails, SMS, logs) and automatically assigns a risk score and level (Info, Low, Medium, High, Critical).
+-   **High-Fidelity YARA Generation:** Creates specific, low-noise YARA rules based on concrete evidence, preventing false positive floods.
+-   **MITRE ATT&CK® Mapping:** Adds strategic context by mapping inputs to relevant adversary tactics and techniques.
+-   **Context-Rich IoC Reporting:** Extracts URLs, IPs, domains, and emails and links them back to their source input and risk level.
+-   **Extremely Tunable:** The entire detection logic is controlled by external JSON "primitive" files. Adapt to new threats without changing any code.
+-   **Production-Ready:** Scalable, resilient, and heavily documented for operational use.
+
+### Getting Started
+
+#### 1. Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/your-repo/HunterEngine.git
+cd HunterEngine
+
+# Install dependencies
+pip install -r requirements.txt
+  
+2. First Run
+The first time you run the script, it will automatically download and cache the necessary MITRE ATT&CK data (~70MB).
+code Bash
+downloadcontent_copy
+expand_less
+    python3 HunterEngine.py /path/to/your/input.txt
+  
+3. Example Usage with Custom Profiles
+HunterEngine comes with pre-built configuration profiles for different threat models.
+
+    # Analyze a CSV of emails using a profile tuned for Business Email Compromise
+python3 HunterEngine.py emails.csv -c primitives/bec_financial_primitives.json
+
+# Analyze system logs for signs of data exfiltration
+python3 HunterEngine.py syslogs.txt -c primitives/insider_exfil_primitives.json
+  
+Understanding the Output
+All results are saved in the HunterEngineBox/ directory, inside a folder named with the session's timestamp.
+* _summary_report.md: Start here. A high-level report for quick identification of critical findings.
+* _all_yara_rules.yara: A single file containing all generated YARA rules, ready for deployment.
+* _all_indicators.json: A list of all IoCs found, linked back to their source input and risk level.
+* results.json: The raw, detailed JSON output for every single input.
+* _stats.json: High-level statistics about the run.
+Customization
+The real power of HunterEngine is its adaptability. See the full MANUAL.md for a detailed guide on creating and tuning your own primitive files.
+License
+This project is licensed under the MIT License. See the LICENSE file for details. Please also review the LEGAL_DISCLOSURE.md for our ethical use policy.
+
+    ---
+---
+
+### **FILE 3: `LICENSE`**
+  
+MIT License
+Copyright (c) 2025 PsypherLabs
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+    ---
+---
+
+### **FILE 4: `LEGAL_DISCLOSURE.md`**
+
+```markdown
+# Legal & Ethical Use Disclosure
+
+## Legal Disclaimer
+This tool is provided "AS IS" without any warranty of any kind. The authors and contributors are not responsible for any misuse or damage caused by this program. The use of this software is at your own risk. You are solely responsible for your actions and for complying with all applicable laws in your jurisdiction.
+
+## Ethical Use Policy
+`HunterEngine` is a tool created for legitimate cybersecurity purposes. Its intended use cases include:
+
+-   **Blue Teams:** Analyzing suspicious emails, messages, and logs to triage threats and build detections.
+-   **Threat Hunters:** Generating high-fidelity YARA rules to proactively hunt for threats in an environment.
+-   **Security Researchers:** Studying the language and indicators used in malicious campaigns.
+-   **Educational Purposes:** Training security professionals in threat analysis and detection engineering.
+
+**Unauthorized and Unethical use of this tool is strictly prohibited.** Do not use this tool on any system or with any data for which you do not have explicit, written permission. Misuse of this tool for malicious purposes may lead to legal consequences.
+  
+
+
+FILE 5: MANUAL.md
+
+    # HunterEngine - The Complete User Manual
+
+## 1. Introduction
+Welcome to `HunterEngine`, a standalone Heuristic Threat Enrichment Engine. This manual provides a comprehensive guide for security operators on using, configuring, and mastering the tool. `HunterEngine` is designed to bridge the gap between raw, unstructured text and actionable security intelligence, automating the tedious work of initial threat triage and detection engineering.
+
+## 2. Core Concepts
+Understanding the engine's design philosophy is key to using it effectively.
+
+-   **Heuristic Primitives:** The engine is built on the idea that malicious communications, regardless of the specific campaign, often share common psychological triggers. We call these "primitives" (e.g., `urgency`, `authority`). By identifying these building blocks, we can create flexible and resilient detections.
+-   **Additive Scoring:** The risk model is simple and transparent. Each finding (a matched primitive, an IoC, a MITRE TTP) adds a pre-defined value to a running total. This makes it easy to understand *why* an input received a certain score.
+-   **Fidelity First:** The engine's primary goal is to produce high-confidence alerts and detections. The YARA generation logic includes a critical "fidelity guardrail" that prevents the creation of rules based on weak evidence, ensuring that the output is immediately useful and does not flood your environment with false positives.
+
+## 3. Installation & Setup
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/your-repo/HunterEngine.git
+    cd HunterEngine
+    ```
+2.  **Install Dependencies:** The engine requires a few Python libraries. Install them using the provided `requirements.txt` file.
+    ```bash
+    pip install -r requirements.txt
+    ```
+3.  **First Run (Automatic Setup):** The first time you run `HunterEngine.py`, it will automatically download the MITRE ATT&CK dataset (approx. 70MB) and create a local cache file (`mitre_cache.json`) for fast performance on subsequent runs.
+
+## 4. Execution Guide
+The engine is run from the command line.
+
+#### **Basic Syntax**
+```bash
+python3 HunterEngine.py <input_file> [options]
+  
+* <input_file>: (Required) The path to your input file. Supported formats are .txt, .csv, and .json.
+Options
+* -c, --config <path>: Specify a path to a custom primitives JSON file. This is how you switch between different detection models.
+* --no-banner: A flag to suppress the startup banner and manual text for cleaner output, useful in automated scripts.
+Example Commands
+
+    # Analyze a simple text file with the default phishing profile
+python3 HunterEngine.py suspicious_sms.txt
+
+# Analyze a CSV of emails using the BEC profile
+python3 HunterEngine.py emails.csv -c primitives/bec_financial_primitives.json
+
+# Run in a script without the banner
+python3 HunterEngine.py logs.json --no-banner
+  
+5. The Art of Customization: A Cookbook
+The engine's true power is unlocked through customization. The JSON files in the primitives/ directory are your control panel.
+Anatomy of a Primitive File
+* config: Global settings for the engine.
+    * fuzzy_threshold: How closely a phrase must match a MITRE TTP description (0-100).
+    * risk_thresholds: The score boundaries for LOW, MEDIUM, and HIGH risk levels.
+    * score_boosts: The points added when an IoC or MITRE TTP is found.
+* primitives: The heart of the detection logic.
+    * Each key (e.g., "urgency") is a new primitive.
+    * score: The number of points to add when this primitive is matched.
+    * keywords: A list of words or phrases that trigger this primitive.
+Recipe 1: Creating a New Primitive
+Goal: Detect lures related to package delivery scams.
+1. Open primitives/default_phishing_primitives.json.
+2. Under the primitives object, add a new key, "delivery_lure".
+3. Give it a moderate score, like 3.
+4. Add keywords common to these scams.
+code JSON
+downloadcontent_copy
+expand_less
+    "delivery_lure": {
+  "score": 3,
+  "keywords": ["delivery failed", "package on hold", "track your shipment", "customs fee", "missed delivery", "reschedule delivery"]
+},
+  
+1. Save the file. The engine will now use this new logic on its next run.
+Recipe 2: Tuning for a Specific Environment
+Goal: Your company is a financial institution. You want to be more aggressive in flagging potential fraud.
+1. Use the primitives/bec_financial_primitives.json as a starting point.
+2. Increase the score for the "bec_financial_lure" primitive from 6 to 8.
+3. Lower the risk thresholds. Change the "HIGH" threshold in the config section from 10 to 8.
+Result: Now, a single match on a high-confidence BEC keyword will instantly flag an email as HIGH risk.
+Recipe 3: Reducing Noise
+Goal: The keyword "admin" is triggering alerts on legitimate password reset emails from your IT department.
+1. Find the "authority" primitive in your config file.
+2. Option A (Lower Score): Reduce the score of the authority primitive from 4 to 2.
+3. Option B (More Specific Keyword): Change the keyword from "admin" to "domain admin".
+4. Option C (Add to Benign): Add specific phrases from your IT department to the benign primitive's keyword list, like "IT service desk password reset".
+6. Advanced Topics & Roadmap
+* API Integration: Future versions could integrate with APIs like VirusTotal to check the reputation of found IoCs and adjust the risk score accordingly.
+* Machine Learning: The structured output of this engine is perfect for training a machine learning classifier to identify more nuanced patterns over time.
+7. Troubleshooting
+* "ModuleNotFoundError": Ensure you have run pip install -r requirements.txt.
+* MITRE Download Fails: Check your internet connection and firewall rules. The script needs to reach github.com.
+* No Output Generated: Ensure your input file is not empty and is in a supported format. Check for errors in the console.
+
+    ---
+---
+
+### **FILE 6: `requirements.txt`**
+  
+requests tqdm rapidfuzz stix2
+code Code
+downloadcontent_copy
+expand_less
+    ---
+---
+
+### **FILE 7: `primitives/default_phishing_primitives.json`**
+
+```json
+{
+  "config": {
+    "fuzzy_threshold": 85,
+    "risk_thresholds": {
+      "LOW": 4,
+      "MEDIUM": 8,
+      "HIGH": 12
+    },
+    "score_boosts": {
+      "has_indicator": 5,
+      "mitre_ttp": 6
+    }
+  },
+  "primitives": {
+    "urgency": {
+      "score": 3,
+      "keywords": ["urgent", "immediate", "action required", "expires", "final notice", "now", "today", "overdue", "important notice", "pending notification", "expired"]
+    },
+    "authority": {
+      "score": 4,
+      "keywords": ["irs", "fbi", "hr", "it department", "security alert", "microsoft", "google", "apple", "docusign", "fedex", "paypal", "bank", "admin"]
+    },
+    "consequence": {
+      "score": 4,
+      "keywords": ["suspended", "locked", "deleted", "compromised", "violation", "legal complaint", "investigated", "breach", "failed", "closure", "identity theft", "flagged", "strange activity"]
+    },
+    "financial": {
+      "score": 3,
+      "keywords": ["invoice", "payment", "wire transfer", "crypto", "reward", "winner", "prize", "gift card", "bonus", "tax return"]
+    },
+    "action_request": {
+      "score": 3,
+      "keywords": ["click", "download", "verify", "authenticate", "scan", "login", "update", "reset", "review", "view documents", "sign in", "approve", "confirm", "authorize", "tap here", "enter password", "portal", "unlock", "qr code", "calendar invite"]
+    },
+    "technical_lure": {
+      "score": 3,
+      "keywords": ["malware", "vpn", "reboot", "browser detected", "session activated", "system errors", "critical errors", "quarantined", "encrypted", "voicemail", "remote access", "mfa code"]
+    },
+    "benign": {
+      "score": 0,
+      "keywords": ["text stop", "unsubscribe", "press 1"]
+    }
+  }
+}
+  
+
+
+FILE 8: primitives/bec_financial_primitives.json
+
+    {
+  "config": {
+    "fuzzy_threshold": 85,
+    "risk_thresholds": {
+      "LOW": 4,
+      "MEDIUM": 7,
+      "HIGH": 10
+    },
+    "score_boosts": {
+      "has_indicator": 4,
+      "mitre_ttp": 4
+    }
+  },
+  "primitives": {
+    "bec_financial_lure": {
+      "score": 6,
+      "keywords": ["wire instructions", "change of bank", "updated invoice", "swift code", "routing number", "bank details", "payment change", "ach payment"]
+    },
+    "urgency": {
+      "score": 4,
+      "keywords": ["urgent", "immediate", "today", "end of day", "asap", "needs to be done now"]
+    },
+    "authority_impersonation": {
+      "score": 5,
+      "keywords": ["ceo", "cfo", "president", "manager", "director", "are you at your desk", "i need a favor"]
+    },
+    "financial": {
+      "score": 3,
+      "keywords": ["invoice", "payment", "wire transfer", "transfer", "remittance", "closing costs"]
+    },
+    "benign": {
+      "score": 0,
+      "keywords": ["unsubscribe", "view statement"]
+    }
+  }
+}
+  
+
+
+FILE 9: primitives/insider_exfil_primitives.json
+
+    {
+  "config": {
+    "fuzzy_threshold": 80,
+    "risk_thresholds": {
+      "LOW": 3,
+      "MEDIUM": 6,
+      "HIGH": 9
+    },
+    "score_boosts": {
+      "has_indicator": 5,
+      "mitre_ttp": 5
+    }
+  },
+  "primitives": {
+    "data_sensitivity": {
+      "score": 5,
+      "keywords": ["confidential", "proprietary", "internal use only", "trade secret", "customer list", "salary", "ssn", "pii", "classified"]
+    },
+    "exfil_channel": {
+      "score": 4,
+      "keywords": ["usb drive", "personal email", "cloud storage", "dropbox", "mega.nz", "wetransfer", "google drive", "burn address", "pastebin"]
+    },
+    "suspicious_activity": {
+      "score": 3,
+      "keywords": ["export", "download all", "copying files", "large transfer", "after hours", "off-boarding", "resignation"]
+    },
+    "benign": {
+      "score": 0,
+      "keywords": ["team drive", "shared folder", "standard report"]
+    }
+  }
+}
+  
+
