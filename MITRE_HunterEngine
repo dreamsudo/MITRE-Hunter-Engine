@@ -1,5 +1,19 @@
-# HunterEngine - Heuristic Threat Enrichment Engine
 
+# HunterEngine - Heuristic Threat Enrichment Engine
+Project Structure Overview
+
+    HunterEngine/
+├── HunterEngine.py
+├── README.md
+├── LICENSE
+├── MANUAL.md
+├── LEGAL_DISCLOSURE.md
+├── requirements.txt
+└── primitives/
+    ├── default_phishing_primitives.json
+    ├── bec_financial_primitives.json
+    └── insider_exfil_primitives.json
+  
 HunterEngine is a command line threat enrichment engine for:
 
 - blue teams
